@@ -1,19 +1,18 @@
-fastapi>=0.110.0,<0.122.0
-uvicorn[standard]>=0.27.0,<0.39.0
+fastapi==0.121.0
+uvicorn[standard]==0.38.0
 
-# LangChain modular packages
-langchain-core>=1.0.0,<1.2.0
-langchain-text-splitters>=0.1.0,<1.2.0
-langchain-community>=0.2.0,<0.3.0
-langsmith>=0.4.0,<0.5.0
+# Compatible LangChain modular packages
+langchain-core==0.2.35
+langchain-text-splitters==0.2.1
+langchain-community==0.2.11
+langsmith==0.1.64
 
-# Vector & embeddings
-faiss-cpu>=1.12.0
-pypdf>=6.0.0
-openai>=1.0.0
+# Vector search & embeddings
+faiss-cpu==1.12.0
+pypdf==6.1.3
+openai==1.12.0
 
-# Utilities
-python-multipart>=0.0.5
-python-dotenv>=1.0.0
-tqdm>=4.60.0
-
+# Misc utilities
+python-multipart==0.0.20
+python-dotenv==1.2.1
+tqdm==4.67.1
