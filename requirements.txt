@@ -4,6 +4,4 @@ langchain
 langchain-text-splitters
 sentence-transformers
 faiss-cpu
-pypdf
-transformers
-numpy
+pydantic
