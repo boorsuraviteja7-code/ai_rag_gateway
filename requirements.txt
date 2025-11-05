@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-langchain
 langchain-text-splitters
 faiss-cpu
 pypdf
