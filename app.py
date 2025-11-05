@@ -1,59 +1,68 @@
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# app.py
+from fastapi import FastAPI, UploadFile, Form
+from pydantic import BaseModel
+import tempfile
 from sentence_transformers import SentenceTransformer
-from pypdf import PdfReader
-import faiss
-import numpy as np
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+import os
 
-app = FastAPI(title="AI Knowledge Assistant")
+# --- Initialize FastAPI app ---
+app = FastAPI(title="AI RAG Gateway (Lightweight Version)")
 
-# Load embedding model
-embedder = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# --- Global vars (lazy initialization) ---
+model = None
+vectorstore = None
 
-# Load small T5 model for generating short answers
-t5_name = "google/flan-t5-base"
-t5_tok = AutoTokenizer.from_pretrained(t5_name)
-t5_model = AutoModelForSeq2SeqLM.from_pretrained(t5_name)
+# --- Function to lazy-load the model only once ---
+def load_model():
+    global model
+    if model is None:
+        print("Loading embedding model (this may take ~30s)...")
+        model = SentenceTransformer("all-MiniLM-L6-v2")
+    return model
 
-index, meta = None, []
+
+@app.get("/")
+async def root():
+    return {"message": "AI RAG Gateway is running!"}
+
 
 @app.post("/upload")
-async def upload(file: UploadFile = File(...)):
-    """Upload a PDF → extract → split → embed → store in FAISS."""
-    global index, meta
-    text = ""
-    reader = PdfReader(file.file)
-    for p in reader.pages:
-        text += p.extract_text() or ""
+async def upload_file(file: UploadFile):
+    """Upload and embed a document"""
+    global vectorstore
+    model = load_model()
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp:
+        temp.write(await file.read())
+        temp_path = temp.name
+
+    # Read and split the document
+    with open(temp_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.split_text(text)
-    meta = [{"text": c, "doc": file.filename} for c in chunks]
-    vecs = embedder.encode([m["text"] for m in meta], normalize_embeddings=True)
 
-    index = faiss.IndexFlatIP(vecs.shape[1])
-    index.add(np.array(vecs, dtype="float32"))
-    return {"chunks": len(chunks), "doc": file.filename}
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    vectorstore = FAISS.from_texts(chunks, embedding=embeddings)
+
+    os.remove(temp_path)
+    return {"status": "File processed and stored"}
+
+
+class Query(BaseModel):
+    question: str
+
 
 @app.post("/query")
-async def query(q: str = Form(...)):
-    """Answer questions based on uploaded PDF content."""
-    if index is None:
-        return JSONResponse({"error": "No document uploaded"}, status_code=400)
+async def query_doc(q: Query):
+    """Query the embedded document"""
+    global vectorstore
+    if vectorstore is None:
+        return {"error": "No document uploaded yet!"}
 
-    qv = embedder.encode([q], normalize_embeddings=True)
-    D, I = index.search(np.array(qv, dtype="float32"), 3)
-    retrieved = [meta[i]["text"].replace("\n", " ").strip() for i in I[0]]
-    context = "\n\n".join(retrieved)
-    prompt = (
-        "Answer the question using ONLY the context. "
-        "If the answer is not in context, reply exactly: I don't know.\n\n"
-        f"Context:\n{context}\n\nQuestion: {q}\nShort answer:"
-    )
-    inputs = t5_tok(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    outputs = t5_model.generate(**inputs, max_new_tokens=80, num_beams=4, temperature=0.2, early_stopping=True)
-    answer = t5_tok.decode(outputs[0], skip_special_tokens=True).strip()
-    sources = [{"doc": meta[i]["doc"], "snippet": meta[i]["text"][:180] + "…"} for i in I[0]]
-    return JSONResponse({"answer": answer, "sources": sources})
+    docs = vectorstore.similarity_search(q.question, k=3)
+    return {"answer_chunks": [d.page_content for d in docs]}
