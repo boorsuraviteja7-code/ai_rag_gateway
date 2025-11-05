@@ -3,3 +3,4 @@ uvicorn[standard]
 langchain-text-splitters
 faiss-cpu
 pypdf
+python-multipart
