@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-langchain
-langchain-text-splitters
-sentence-transformers
-faiss-cpu
-pydantic
+triton
+torch
+torchvision
+torchaudio
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cusolver-cu12
