@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 langchain
+langchain-text-splitters
 sentence-transformers
 faiss-cpu
 pypdf
