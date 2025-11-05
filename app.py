@@ -1,107 +1,147 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_openai import OpenAIEmbeddings
 import os
-import shutil
-from tempfile import NamedTemporaryFile
+from typing import List
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from openai import OpenAI
+from pypdf import PdfReader
+from pathlib import Path
 
-# Initialize FastAPI app
-app = FastAPI(title="AI RAG Gateway", version="1.0")
+# FAISS: use the new import path for 1.12.0
+from langchain_community.vectorstores import FAISS
 
-# Allow CORS (lets frontend / Postman access your API)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="AI RAG Gateway", version="1.0.0")
 
-# Global FAISS index variable
-index = None
+INDEX_DIR = "faiss_index"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # small & cheap, good enough
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# 🩺 HEALTH CHECK ENDPOINT
+# ---- Embeddings wrapper using OpenAI (langchain-compatible) ----
+class OpenAIEmb(Embeddings):
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # batch appropriately for your size; here simple split
+        out = []
+        for t in texts:
+            resp = client.embeddings.create(model=EMBED_MODEL, input=t)
+            out.append(resp.data[0].embedding)
+        return out
+
+    def embed_query(self, text: str) -> List[float]:
+        resp = client.embeddings.create(model=EMBED_MODEL, input=text)
+        return resp.data[0].embedding
+
+def load_index():
+    if not Path(INDEX_DIR).exists():
+        return None
+    return FAISS.load_local(INDEX_DIR, OpenAIEmb(), allow_dangerous_deserialization=True)
+
+def save_index(db: FAISS):
+    db.save_local(INDEX_DIR)
+
 @app.get("/health")
 def health():
-    """
-    Simple endpoint to confirm if your API is running.
-    It also shows how many vector embeddings are currently loaded.
-    """
-    global index
-    return {
-        "status": "ok",
-        "vectors": int(index.index.ntotal) if index else 0
-    }
+    db = load_index()
+    vectors = 0
+    if db and hasattr(db, "index") and hasattr(db.index, "ntotal"):
+        vectors = db.index.ntotal
+    return {"status": "ok", "vectors": vectors}
 
+@app.get("/")
+def root():
+    # Keep root minimal; docs are at /docs
+    return {"message": "OK. See /docs for Swagger UI."}
 
-# 📂 UPLOAD ENDPOINT
+# ---------- Upload PDF & (re)build index ----------
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a PDF file, split text, embed it using OpenAI,
-    and save a FAISS vector index.
-    """
-    global index
+async def upload(file: UploadFile = File(...)):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    # Save uploaded file temporarily
-    with NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF")
 
-    # Load PDF
-    loader = PyPDFLoader(tmp_path)
-    docs = loader.load()
+    # Read PDF pages
+    try:
+        pdf_bytes = await file.read()
+        reader = PdfReader(bytes(pdf_bytes))
+        pages_text = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text() or ""
+            if text.strip():
+                pages_text.append(text)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"PDF parse failed: {e}")
 
-    # Split text into overlapping chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
-    chunks = text_splitter.split_documents(docs)
+    if not pages_text:
+        raise HTTPException(status_code=400, detail="No extractable text found in PDF")
 
-    # Create embeddings
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+    # Chunk
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks: List[str] = []
+    for t in pages_text:
+        chunks.extend(splitter.split_text(t))
 
-    # Build FAISS vector store
-    index = FAISS.from_documents(chunks, embeddings)
-    index.save_local("faiss_index")
+    docs = [Document(page_content=ch) for ch in chunks]
 
-    os.remove(tmp_path)  # Clean up the temp file
+    # Build FAISS index
+    emb = OpenAIEmb()
+    db = FAISS.from_documents(docs, emb)
+    save_index(db)
 
-    return {"doc": file.filename, "chunks": len(chunks), "vectors": index.index.ntotal}
+    return {"status": "indexed", "chunks": len(docs)}
 
+# ---------- Query ----------
+class QueryIn(BaseModel):
+    query: str
+    k: int = 4
+    score_threshold: float | None = None  # optional
 
-# 💬 QUERY ENDPOINT
 @app.post("/query")
-async def query_document(payload: dict):
-    """
-    Query the FAISS index to find related text for a given question.
-    """
-    global index
-    if not index:
-        # Load FAISS index if not already loaded
-        if os.path.exists("faiss_index"):
-            embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-            index = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
-        else:
-            return {"error": "No index loaded. Please upload a PDF first."}
+def query(inq: QueryIn):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
-    query_text = payload.get("query")
-    if not query_text:
-        return {"error": "Missing 'query' parameter"}
+    db = load_index()
+    if not db:
+        raise HTTPException(status_code=404, detail="No index on disk. Upload a PDF first.")
 
-    # Perform similarity search
-    docs = index.similarity_search(query_text, k=3)
-    response = {
-        "answer": docs[0].page_content if docs else "No relevant text found.",
-        "sources": [
-            {"doc": "deposit-account-agreement.pdf", "snippet": d.page_content[:200]} for d in docs
-        ],
-    }
+    # similarity search
+    if inq.score_threshold is not None:
+        pairs = db.similarity_search_with_score(inq.query, k=max(inq.k, 5))
+        docs = [d for d, score in pairs if score is None or score > inq.score_threshold]
+        if not docs:
+            # fallback to top-k if threshold filters everything out
+            docs = [d for d, _ in pairs[:inq.k]]
+    else:
+        docs = db.similarity_search(inq.query, k=inq.k)
 
-    return response
+    context = "\n\n".join([d.page_content for d in docs[:inq.k]])
 
+    # Simple RAG answer with OpenAI responses API
+    # (If you prefer chat models, you can switch to client.chat.completions)
+    prompt = f"""You are a helpful banking assistant. Answer using only the facts in CONTEXT.
+If the answer is not in the context, say you don't know.
+
+CONTEXT:
+{context}
+
+QUESTION: {inq.query}
+ANSWER:"""
+
+    resp = client.responses.create(
+        model=os.getenv("GEN_MODEL", "gpt-4.1-mini"),
+        input=prompt
+    )
+    answer = resp.output[0].content[0].text if resp and resp.output else "I couldn't generate an answer."
+
+    # Return short source snippets
+    sources = []
+    for d in docs[:inq.k]:
+        snippet = d.page_content[:220].replace("\n", " ")
+        sources.append({"doc": "uploaded.pdf", "snippet": snippet + ("..." if len(d.page_content) > 220 else "")})
+
+    return {"answer": answer, "sources": sources}
