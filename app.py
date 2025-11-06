@@ -12,16 +12,18 @@ from pathlib import Path
 import numpy as np
 
 # ----------------------------------------------------
-# ✅ Optimize for low memory
+# ✅ Optimize memory + offline model caching
 # ----------------------------------------------------
-torch.set_num_threads(1)  # prevent PyTorch from spawning extra threads
+torch.set_num_threads(1)
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/tmp"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 # ----------------------------------------------------
 # ✅ Initialize FastAPI
 # ----------------------------------------------------
-app = FastAPI(title="AI RAG Gateway (Free Version)", version="1.0")
+app = FastAPI(title="AI RAG Gateway (Free & Stable)", version="2.0")
 
-# Enable CORS (so you can access via browser or Postman)
+# Allow browser/Postman access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,31 +33,27 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------
-# ✅ Load Lightweight Local Embedding Model (cached)
+# ✅ Load lightweight embedding model
 # ----------------------------------------------------
-# Cache model under /tmp (Render allows this space)
-os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/tmp"
-
-# Use the lightweight model (only ~120 MB)
 embedding_model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L3-v2")
 
 def get_embeddings(texts):
-    """Generate embeddings locally without OpenAI API."""
+    """Generate local embeddings without any API or cost."""
     try:
-        embeddings = embedding_model.encode(texts)
-        return np.array(embeddings).tolist()
+        emb = embedding_model.encode(texts)
+        return np.array(emb).tolist()
     except Exception as e:
-        raise RuntimeError(f"Local embedding generation failed: {e}")
+        raise RuntimeError(f"Embedding failed: {e}")
 
 # ----------------------------------------------------
-# ✅ Create Vector Store Folder
+# ✅ Vector store setup
 # ----------------------------------------------------
 VECTOR_STORE_PATH = "vector_store"
 os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
 vector_store = None
 
 # ----------------------------------------------------
-# ✅ Health Check Endpoint
+# ✅ Health check
 # ----------------------------------------------------
 @app.get("/health")
 def health():
@@ -65,45 +63,39 @@ def health():
     }
 
 # ----------------------------------------------------
-# ✅ PDF Upload Endpoint
+# ✅ Upload PDF → generate embeddings → store in FAISS
 # ----------------------------------------------------
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload a PDF and create vector embeddings."""
     try:
         if not file.filename.endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Please upload a PDF file")
+            raise HTTPException(status_code=400, detail="Please upload a PDF file.")
 
         pdf_path = Path(VECTOR_STORE_PATH) / file.filename
         with open(pdf_path, "wb") as f:
             f.write(await file.read())
 
+        # Extract text
         pdf_reader = PdfReader(str(pdf_path))
-        text = ""
-        for page in pdf_reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text
-
+        text = "".join(page.extract_text() or "" for page in pdf_reader.pages)
         if not text.strip():
-            raise HTTPException(status_code=400, detail="No text found in the PDF")
+            raise HTTPException(status_code=400, detail="No text found in the PDF.")
 
         # Split into chunks
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
         chunks = splitter.split_text(text)
         docs = [Document(page_content=c) for c in chunks]
 
-        # Generate local embeddings
-        embeddings_list = get_embeddings([doc.page_content for doc in docs])
+        # Embeddings
+        emb_list = get_embeddings([d.page_content for d in docs])
 
-        # Create FAISS index
+        # Create FAISS index (float16 saves memory)
         from langchain_community.vectorstores.faiss import dependable_faiss_import
         faiss = dependable_faiss_import()
-        dim = len(embeddings_list[0])
+        dim = len(emb_list[0])
         index = faiss.IndexFlatL2(dim)
-        index.add(np.array(embeddings_list).astype("float32"))
+        index.add(np.array(emb_list).astype("float16"))
 
-        # Store globally
         global vector_store
         vector_store = FAISS(embedding_function=get_embeddings, index=index, documents=docs)
 
@@ -113,24 +105,22 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 # ----------------------------------------------------
-# ✅ Query Endpoint
+# ✅ Query endpoint
 # ----------------------------------------------------
 class QueryRequest(BaseModel):
     query: str
 
 @app.post("/query")
 async def query_rag(request: QueryRequest):
-    """Query the stored embeddings for similarity search."""
     try:
         global vector_store
         if not vector_store:
             raise HTTPException(status_code=400, detail="No documents indexed yet. Please upload a PDF first.")
 
-        query_vector = get_embeddings([request.query])[0]
-        D, I = vector_store.index.search(np.array([query_vector]).astype("float32"), k=3)
-        matched_docs = [vector_store.documents[i].page_content for i in I[0]]
+        qv = get_embeddings([request.query])[0]
+        D, I = vector_store.index.search(np.array([qv]).astype("float16"), k=3)
+        results = [vector_store.documents[i].page_content for i in I[0]]
 
-        return {"answer": " ".join(matched_docs)[:1000]}
-
+        return {"answer": " ".join(results)[:1000]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
