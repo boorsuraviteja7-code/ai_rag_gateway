@@ -1,23 +1,21 @@
 import os
-from pathlib import Path
-
-import numpy as np
-import httpx
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pypdf import PdfReader
+from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-import faiss  # from faiss-cpu
-from dotenv import load_dotenv
+from langchain_core.documents import Document
+from sentence_transformers import SentenceTransformer
+from pypdf import PdfReader
+from pathlib import Path
+import numpy as np
 
-load_dotenv()
+# ----------------------------------------------------
+# ✅ Initialize FastAPI
+# ----------------------------------------------------
+app = FastAPI(title="AI RAG Gateway (Free Version)", version="1.0")
 
-# ---------------------------
-# FastAPI app
-# ---------------------------
-app = FastAPI(title="AI RAG Gateway", version="1.1")
-
+# Enable CORS (so you can access via browser or Postman)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,160 +24,101 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # must be set in Render -> Environment
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
+# ----------------------------------------------------
+# ✅ Load Local Embedding Model (no OpenAI key needed)
+# ----------------------------------------------------
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
-VECTOR_STORE_DIR = Path("vector_store")
-VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------
-# In-memory state
-# ---------------------------
-# We maintain a single FAISS index & the corresponding chunk texts.
-# (Render free tier may spin down; persistence is OPTIONAL here.)
-INDEX = None              # faiss.IndexFlatIP (cosine similarity with normalized vectors)
-EMBED_DIM = 1536          # text-embedding-3-small
-CHUNKS: list[str] = []    # same order as vectors added to FAISS
-
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def _normalize(vectors: np.ndarray) -> np.ndarray:
-    """L2-normalize for cosine similarity with IndexFlatIP."""
-    norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
-    return vectors / norms
-
-
-def get_embeddings_httpx(texts: list[str]) -> np.ndarray:
-    """
-    Call OpenAI embeddings via raw HTTP to avoid the SDK and the 'proxies' bug.
-    Returns float32 numpy array of shape (n, EMBED_DIM)
-    """
-    url = "https://api.openai.com/v1/embeddings"
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": "text-embedding-3-small",
-        "input": texts,
-    }
+def get_embeddings(texts):
+    """Generate embeddings locally without OpenAI API."""
     try:
-        # do NOT pass proxies — we want a plain call
-        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-            resp = client.post(url, headers=headers, json=payload)
-        if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-        data = resp.json()
-        vecs = [d["embedding"] for d in data["data"]]
-        arr = np.array(vecs, dtype=np.float32)
-        return arr
+        embeddings = embedding_model.encode(texts)
+        return np.array(embeddings).tolist()
     except Exception as e:
-        raise RuntimeError(f"Embedding HTTP call failed: {e}")
+        raise RuntimeError(f"Local embedding generation failed: {e}")
 
+# ----------------------------------------------------
+# ✅ Create Vector Store Folder
+# ----------------------------------------------------
+VECTOR_STORE_PATH = "vector_store"
+os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
+vector_store = None
 
-def pdf_to_text(path: Path) -> str:
-    reader = PdfReader(str(path))
-    out = []
-    for p in reader.pages:
-        t = p.extract_text() or ""
-        if t.strip():
-            out.append(t)
-    return "\n\n".join(out)
-
-
-# ---------------------------
-# Routes
-# ---------------------------
+# ----------------------------------------------------
+# ✅ Health Check Endpoint
+# ----------------------------------------------------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
-        "indexed_chunks": len(CHUNKS),
-        "embed_dim": EMBED_DIM,
-        "has_index": INDEX is not None,
+        "vectors": len(vector_store.index_to_docstore_id) if vector_store else 0
     }
 
-
+# ----------------------------------------------------
+# ✅ PDF Upload Endpoint
+# ----------------------------------------------------
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Upload a PDF, split to chunks, embed via raw HTTP, and build FAISS index.
-    """
+    """Upload a PDF and create vector embeddings."""
     try:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Please upload a PDF")
+        if not file.filename.endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
-        # save locally (optional but handy for debugging)
-        path = VECTOR_STORE_DIR / file.filename
-        with open(path, "wb") as f:
+        pdf_path = Path(VECTOR_STORE_PATH) / file.filename
+        with open(pdf_path, "wb") as f:
             f.write(await file.read())
 
-        text = pdf_to_text(path)
+        pdf_reader = PdfReader(str(pdf_path))
+        text = ""
+        for page in pdf_reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text
+
         if not text.strip():
-            raise HTTPException(status_code=400, detail="No extractable text in PDF")
+            raise HTTPException(status_code=400, detail="No text found in the PDF")
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = splitter.split_text(text)
-        if not chunks:
-            raise HTTPException(status_code=400, detail="No chunks generated from PDF")
+        docs = [Document(page_content=c) for c in chunks]
 
-        # Get embeddings (n, d) and normalize for cosine/IP search
-        embeds = get_embeddings_httpx(chunks)
-        embeds = _normalize(embeds)
+        # Generate local embeddings
+        embeddings_list = get_embeddings([doc.page_content for doc in docs])
 
-        # Build FAISS index
-        global INDEX, CHUNKS
-        INDEX = faiss.IndexFlatIP(embeds.shape[1])  # IP + normalized -> cosine
-        INDEX.add(embeds)
-        CHUNKS = chunks
+        # Create FAISS index
+        from langchain_community.vectorstores.faiss import dependable_faiss_import
+        faiss = dependable_faiss_import()
+        dim = len(embeddings_list[0])
+        index = faiss.IndexFlatL2(dim)
+        index.add(np.array(embeddings_list).astype("float32"))
 
-        return {"message": f"{file.filename} processed", "chunks": len(chunks)}
+        global vector_store
+        vector_store = FAISS(embedding_function=get_embeddings, index=index, documents=docs)
 
-    except HTTPException:
-        raise
+        return {"message": f"{file.filename} processed successfully", "chunks": len(docs)}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
-
+# ----------------------------------------------------
+# ✅ Query Endpoint
+# ----------------------------------------------------
 class QueryRequest(BaseModel):
     query: str
-    k: int | None = 3
-
 
 @app.post("/query")
-def query_rag(req: QueryRequest):
-    """
-    Embed the query, search top-k, and return the matched chunk texts.
-    """
+async def query_rag(request: QueryRequest):
+    """Query the stored embeddings for similarity search."""
     try:
-        if INDEX is None or not CHUNKS:
-            raise HTTPException(status_code=400, detail="No documents indexed. Upload a PDF first.")
+        global vector_store
+        if not vector_store:
+            raise HTTPException(status_code=400, detail="No documents indexed yet. Please upload a PDF first.")
 
-        q = req.query.strip()
-        if not q:
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        query_vector = get_embeddings([request.query])[0]
+        D, I = vector_store.index.search(np.array([query_vector]).astype("float32"), k=3)
+        matched_docs = [vector_store.documents[i].page_content for i in I[0]]
 
-        q_vec = get_embeddings_httpx([q])
-        q_vec = _normalize(q_vec)
-        k = max(1, min(req.k or 3, len(CHUNKS)))
+        return {"answer": " ".join(matched_docs)[:1000]}
 
-        D, I = INDEX.search(q_vec.astype(np.float32), k)  # (1, k)
-        hits = []
-        for rank, (idx, score) in enumerate(zip(I[0], D[0]), start=1):
-            hits.append(
-                {
-                    "rank": rank,
-                    "score": float(score),
-                    "text": CHUNKS[idx][:1000],  # clamp for payload size
-                    "chunk_index": int(idx),
-                }
-            )
-        return {"matches": hits}
-
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query error: {e}")
+        raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
