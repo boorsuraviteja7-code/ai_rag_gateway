@@ -35,7 +35,8 @@ app.add_middleware(
 # ----------------------------------------------------
 # ✅ Load lightweight embedding model
 # ----------------------------------------------------
-embedding_model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L3-v2")
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+embedding_model.max_seq_length = 256
 
 def get_embeddings(texts):
     """Generate local embeddings without any API or cost."""
