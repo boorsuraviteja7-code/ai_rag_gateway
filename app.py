@@ -5,31 +5,20 @@ from pydantic import BaseModel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
+from langchain_core.embeddings import Embeddings
 from pypdf import PdfReader
 from pathlib import Path
-import openai  # ✅ NEW IMPORT
+import openai
 
-# ✅ Set OpenAI API key
+app = FastAPI()
+
+# ✅ Initialize OpenAI using new syntax
 openai.api_key = os.getenv("OPENAI_API_KEY")
-if not openai.api_key:
-    raise ValueError("❌ Missing OPENAI_API_KEY environment variable")
 
+vector_store = None
 
-# ---------- FASTAPI ----------
-app = FastAPI(title="AI RAG Gateway", version="3.0")
-
-# Global FAISS index
-vectorstore = None
-
-
-# ---------- MODELS ----------
-class QueryRequest(BaseModel):
-    query: str
-
-
-# ---------- HELPERS ----------
+# ✅ Embedding helper function
 def get_embedding(text: str):
-    """Generate embeddings using OpenAI API (no proxies bug)"""
     response = openai.embeddings.create(
         model="text-embedding-3-small",
         input=text
@@ -37,74 +26,56 @@ def get_embedding(text: str):
     return response.data[0].embedding
 
 
-def load_pdf_and_split(file_path: str) -> List[Document]:
-    """Read a PDF file and split into chunks"""
-    pdf_reader = PdfReader(file_path)
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text() or ""
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_text(text)
-    docs = [Document(page_content=chunk) for chunk in chunks]
-    return docs
-
-
-# ---------- ROUTES ----------
-@app.get("/health")
-def health():
-    """Health check"""
-    return {
-        "status": "ok",
-        "vectors": 0 if vectorstore is None else len(vectorstore.index_to_docstore_id)
-    }
-
-
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Upload and process a PDF into FAISS"""
-    global vectorstore
     try:
-        upload_dir = Path("uploads")
-        upload_dir.mkdir(exist_ok=True)
-        file_path = upload_dir / file.filename
-        with open(file_path, "wb") as f:
+        temp_path = Path(f"/tmp/{file.filename}")
+        with open(temp_path, "wb") as f:
             f.write(await file.read())
 
-        docs = load_pdf_and_split(str(file_path))
-        texts = [d.page_content for d in docs]
-        embeds = [get_embedding(t) for t in texts]
+        reader = PdfReader(temp_path)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
 
-        vectorstore = FAISS.from_embeddings(list(zip(texts, embeds)))
-        return {"message": f"✅ {file.filename} processed successfully", "chunks": len(texts)}
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="No text found in PDF")
 
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+        docs = [Document(page_content=chunk) for chunk in splitter.split_text(text)]
+
+        global vector_store
+        vector_store = FAISS.from_documents(docs, embedding_function=get_embedding)
+
+        return {"message": f"File {file.filename} processed successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
+class QueryRequest(BaseModel):
+    query: str
+
+
 @app.post("/query")
 async def query_rag(request: QueryRequest):
-    """Query the document using RAG"""
-    global vectorstore
-    if vectorstore is None:
-        raise HTTPException(status_code=400, detail="❌ No documents uploaded yet")
+    if not vector_store:
+        raise HTTPException(status_code=400, detail="No document uploaded yet")
+
+    docs = vector_store.similarity_search(request.query, k=3)
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = f"Answer based on the document:\n{context}\n\nQuestion: {request.query}\nAnswer:"
 
     try:
-        query_embed = get_embedding(request.query)
-        results = vectorstore.similarity_search_by_vector(query_embed, k=3)
-        context = "\n".join([r.page_content for r in results])
-
         completion = openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Answer based on the provided document context."},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {request.query}"}
-            ],
-            temperature=0.2
+            messages=[{"role": "user", "content": prompt}]
         )
-
-        answer = completion.choices[0].message.content.strip()
-        return {"answer": answer, "sources": [r.page_content[:200] for r in results]}
-
+        return {"answer": completion.choices[0].message.content}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error during query: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error generating answer: {str(e)}")
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "vectors": len(vector_store.index_to_docstore_id) if vector_store else 0}
