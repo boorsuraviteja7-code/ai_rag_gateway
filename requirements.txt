@@ -11,5 +11,4 @@ python-dotenv==1.2.1
 tqdm==4.67.1
 sentence-transformers==3.0.1
 numpy==1.26.4
-# 🔽 use the first torch version that ships wheels for Python 3.13
 torch==2.5.1
