@@ -1,178 +1,155 @@
 import os
 import sys
-import gc
-import torch
-import numpy as np
-from pathlib import Path
+import uuid
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from pypdf import PdfReader
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 
-# langchain bits (vector store + chunking + doc type)
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
+# -------------------------------------------------------------------
+# 1️⃣  Environment Setup (Render-specific)
+# -------------------------------------------------------------------
+os.environ.update({
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "SENTENCE_TRANSFORMERS_HOME": "/tmp",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TOKENIZERS_PARALLELISM": "false"
+})
 
-# -------------------------------
-#         RUNTIME TUNING
-# -------------------------------
-# keep torch light on CPU
-torch.set_num_threads(1)
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
+# Load Hugging Face token from Render environment (DO NOT hard-code)
+hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# Important: don't download huge models; we will use a tiny sentence-transformers model.
-# DO NOT set TRANSFORMERS_OFFLINE=1 unless you have already cached the model on Render,
-# otherwise first boot will fail when it can't download the files.
-os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", "/tmp")  # cache in ephemeral disk
+if not hf_token:
+    print("⚠️  Warning: HUGGINGFACEHUB_API_TOKEN not found — "
+          "model download may fail if private or rate-limited.")
 
-# -------------------------------
-#         FASTAPI APP
-# -------------------------------
-app = FastAPI(title="AI RAG Gateway (Free & Stable)", version="2.1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# -------------------------------------------------------------------
+# 2️⃣  Initialize FastAPI app
+# -------------------------------------------------------------------
+app = FastAPI(
+    title="RaviTeja GenAI Gateway",
+    version="1.0.0",
+    description="FastAPI app deployed on Render integrating Hugging Face models with lazy loading."
 )
 
-# -------------------------------
-#   LAZY-LOAD EMBEDDING MODEL
-# -------------------------------
-_embedding_model = None
-_MODEL_NAME = "thenlper/gte-tiny"   # ~22M params, very small & accurate for retrieval
+# -------------------------------------------------------------------
+# 3️⃣  Lazy model loading helpers
+# -------------------------------------------------------------------
+embedder = None
+generator = None
 
-def _load_model():
-    """Load the embedding model only when first needed."""
-    global _embedding_model
-    if _embedding_model is None:
-        from sentence_transformers import SentenceTransformer  # import here to avoid heavy import at boot
-        _embedding_model = SentenceTransformer(_MODEL_NAME, device="cpu")
-        # shorter sequence helps RAM; tune if needed
-        try:
-            _embedding_model.max_seq_length = 256
-        except Exception:
-            pass
-    return _embedding_model
 
-def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """Compute embeddings with tiny model, return list of vectors."""
-    try:
-        model = _load_model()
-        # convert to float32 (FAISS default)
-        emb = model.encode(texts, batch_size=16, convert_to_numpy=True, normalize_embeddings=True)
-        if emb.dtype != np.float32:
-            emb = emb.astype(np.float32)
-        return emb.tolist()
-    except Exception as e:
-        # free any cached tensors if something failed
-        gc.collect()
-        raise RuntimeError(f"Embedding failed: {e}") from e
+def get_embedder():
+    """Load embedding model once (lazy)."""
+    global embedder
+    if embedder is None:
+        print("🔹 Loading embedding model...")
+        embedder = SentenceTransformer(
+            "thenlper/gte-tiny",
+            use_auth_token=hf_token  # safe: uses env var, not hard-coded
+        )
+        print("✅ Embedding model loaded successfully.")
+    return embedder
 
-# -------------------------------
-#         VECTOR STORE
-# -------------------------------
-VECTOR_STORE_DIR = "vector_store"
-os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
-# we keep index in-memory; (optional) you can persist to disk later
-vector_store: FAISS | None = None
+def get_generator():
+    """Load text generation model once (lazy)."""
+    global generator
+    if generator is None:
+        print("🔹 Loading generation model...")
+        generator = pipeline(
+            "text2text-generation",
+            model="google/flan-t5-base",
+            token=hf_token
+        )
+        print("✅ Generation model loaded successfully.")
+    return generator
 
-# -------------------------------
-#         HEALTHCHECK
-# -------------------------------
-@app.get("/health")
-def health():
+
+# -------------------------------------------------------------------
+# 4️⃣  Root & Health Routes
+# -------------------------------------------------------------------
+@app.get("/")
+def root():
     return {
-        "status": "ok",
-        "vectors": len(vector_store.index_to_docstore_id) if vector_store else 0,
-        "model": _MODEL_NAME if _embedding_model is not None else "not_loaded"
+        "status": "running",
+        "message": "RaviTeja GenAI Gateway is live ✅",
+        "docs": "/docs",
+        "health": "/health"
     }
 
-# -------------------------------
-#         UPLOAD PDF
-# -------------------------------
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    """
-    Upload one PDF, chunk it, embed it with tiny model, and build FAISS index.
-    """
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+
+
+# -------------------------------------------------------------------
+# 5️⃣  Text Generation Endpoint
+# -------------------------------------------------------------------
+class GenerateRequest(BaseModel):
+    prompt: str
+
+
+@app.post("/generate")
+async def generate_text(req: GenerateRequest):
     try:
+        gen = get_generator()
+        result = gen(req.prompt, max_length=256, do_sample=True)
+        return {"prompt": req.prompt, "response": result[0]["generated_text"]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error generating text: {str(e)}")
+
+
+# -------------------------------------------------------------------
+# 6️⃣  PDF Upload & Embedding Endpoint
+# -------------------------------------------------------------------
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    """Upload a PDF → extract text → embed with Hugging Face model."""
+    try:
+        # ✅ Validate file type
         if not file.filename.lower().endswith(".pdf"):
             raise HTTPException(status_code=400, detail="Please upload a PDF file.")
 
-        pdf_path = Path(VECTOR_STORE_DIR) / file.filename
-        with open(pdf_path, "wb") as f:
-            f.write(await file.read())
+        # ✅ Extract text
+        pdf = PdfReader(file.file)
+        text = ""
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
 
-        # Extract text (pypdf)
-        reader = PdfReader(str(pdf_path))
-        text = "".join(page.extract_text() or "" for page in reader.pages)
         if not text.strip():
-            raise HTTPException(status_code=400, detail="No text found in the PDF.")
+            raise HTTPException(status_code=400, detail="No text extracted from PDF.")
 
-        # Split into overlapping chunks
-        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-        chunks = splitter.split_text(text)
-        if not chunks:
-            raise HTTPException(status_code=400, detail="Could not split PDF into text chunks.")
-        docs = [Document(page_content=c) for c in chunks]
+        # ✅ Embed text using Hugging Face model
+        model = get_embedder()
+        embeddings = model.encode([text])
 
-        # Embeddings (lazy load happens here)
-        vectors = get_embeddings([d.page_content for d in docs])
+        doc_id = str(uuid.uuid4())
 
-        # Build FAISS index (float32 for L2; FAISS expects float32)
-        from langchain_community.vectorstores.faiss import dependable_faiss_import
-        faiss = dependable_faiss_import()
-        dim = len(vectors[0])
-        index = faiss.IndexFlatL2(dim)
-        index.add(np.asarray(vectors, dtype=np.float32))
+        return {
+            "doc_id": doc_id,
+            "filename": file.filename,
+            "text_length": len(text),
+            "embedding_shape": str(embeddings.shape),
+            "preview": text[:1000]
+        }
 
-        global vector_store
-        vector_store = FAISS(embedding_function=get_embeddings, index=index, documents=docs)
-
-        # clean temp memory
-        gc.collect()
-
-        return {"message": f"{file.filename} processed successfully", "chunks": len(docs)}
-
-    except HTTPException:
-        raise
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing file: {e}") from e
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
-# -------------------------------
-#            QUERY
-# -------------------------------
-class QueryRequest(BaseModel):
-    query: str
 
-@app.post("/query")
-async def query_rag(request: QueryRequest):
-    try:
-        global vector_store
-        if not vector_store:
-            raise HTTPException(status_code=400, detail="No documents indexed yet. Upload a PDF first.")
-
-        qv = np.asarray(get_embeddings([request.query])[0], dtype=np.float32)
-
-        # FAISS search
-        D, I = vector_store.index.search(qv.reshape(1, -1), k=3)
-
-        hits = []
-        for idx in I[0]:
-            if idx == -1:
-                continue
-            hits.append(vector_store.documents[idx].page_content)
-
-        answer = " ".join(hits)[:1000] if hits else "No relevant text found."
-        return {"answer": answer, "matches": len(hits)}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Query error: {e}") from e
+# -------------------------------------------------------------------
+# 7️⃣  Application entrypoint for local testing
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
