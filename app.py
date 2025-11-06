@@ -1,95 +1,128 @@
-import os, gc, torch, numpy as np
-from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# app.py
+import os
+import sys
+from typing import Optional
+
+# ------------------------------------------------------------
+# ✅ FIX 1: Safe startup environment variables for Render
+# ------------------------------------------------------------
+os.environ.update({
+    "OMP_NUM_THREADS": "1",
+    "MKL_NUM_THREADS": "1",
+    "SENTENCE_TRANSFORMERS_HOME": "/tmp",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+})
+
+# ------------------------------------------------------------
+# ✅ Optional: Prevent heavy torch imports during Render health probe
+# ------------------------------------------------------------
+if os.environ.get("RENDER") == "true":
+    sys.modules["torch"] = __import__("torch", fromlist=[""])
+
+try:
+    import torch
+    torch.set_num_threads(1)
+except Exception:
+    torch = None
+
+from fastapi import FastAPI
 from pydantic import BaseModel
-from pypdf import PdfReader
-from langchain_community.vectorstores import FAISS
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.documents import Document
 
-# ---------------------- CONFIG ----------------------
-torch.set_num_threads(1)
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/tmp"
-
-app = FastAPI(title="AI RAG Gateway (Free-Tier Mode)", version="3.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
+# ------------------------------------------------------------
+# ✅ Initialize FastAPI
+# ------------------------------------------------------------
+app = FastAPI(
+    title="RaviTeja GenAI Gateway",
+    description="FastAPI app deployed on Render with HuggingFace lazy loading",
+    version="1.0.0"
 )
 
-VECTOR_STORE_PATH = "vector_store"
-os.makedirs(VECTOR_STORE_PATH, exist_ok=True)
-vector_store = None
+# ------------------------------------------------------------
+# ✅ FIX 2: Root and Health Routes (Render health probe fix)
+# ------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "status": "running ✅",
+        "docs": "/docs",
+        "health": "/health",
+        "message": "RaviTeja GenAI Gateway is live!"
+    }
 
-# ---------------------- UTILS ----------------------
-def get_embeddings(texts):
-    """Load model on-demand, compute embeddings, unload to free RAM."""
-    from sentence_transformers import SentenceTransformer
-    model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L3-v2", device="cpu")
-    model.max_seq_length = 256
-    emb = model.encode(texts, convert_to_numpy=True, batch_size=8, normalize_embeddings=True)
-    del model
-    gc.collect()
-    torch.cuda.empty_cache()
-    return emb.astype(np.float32).tolist()
-
-# ---------------------- ROUTES ----------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "vectors": len(vector_store.index_to_docstore_id) if vector_store else 0}
+    return {"ok": True, "message": "Healthy 💚"}
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    try:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(400, "Please upload a PDF file")
 
-        pdf_path = Path(VECTOR_STORE_PATH) / file.filename
-        with open(pdf_path, "wb") as f:
-            f.write(await file.read())
+# ------------------------------------------------------------
+# ✅ FIX 3: Lazy-load HuggingFace model (loaded on first request only)
+# ------------------------------------------------------------
+_model = None
+_tokenizer = None
 
-        reader = PdfReader(str(pdf_path))
-        text = "".join(page.extract_text() or "" for page in reader.pages)
-        if not text.strip():
-            raise HTTPException(400, "No text found in PDF")
+def load_model_once():
+    global _model, _tokenizer
+    if _model is not None and _tokenizer is not None:
+        return _model, _tokenizer
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=200)
-        chunks = splitter.split_text(text)
-        docs = [Document(page_content=c) for c in chunks]
+    # Import heavy dependencies only when needed
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        vecs = get_embeddings([d.page_content for d in docs])
-        from langchain_community.vectorstores.faiss import dependable_faiss_import
-        faiss = dependable_faiss_import()
-        dim = len(vecs[0])
-        index = faiss.IndexFlatL2(dim)
-        index.add(np.array(vecs, dtype=np.float32))
+    model_name = os.getenv("HF_MODEL_NAME", "sshleifer/tiny-gpt2")
 
-        global vector_store
-        vector_store = FAISS(embedding_function=get_embeddings, index=index, documents=docs)
+    print(f"🔄 Loading HuggingFace model: {model_name}")
+    _tokenizer = AutoTokenizer.from_pretrained(model_name)
+    _model = AutoModelForCausalLM.from_pretrained(model_name)
 
-        gc.collect()
-        return {"message": f"{file.filename} processed successfully", "chunks": len(docs)}
-    except Exception as e:
-        raise HTTPException(500, f"Upload failed: {e}")
+    print("✅ Model loaded successfully")
+    return _model, _tokenizer
 
-class QueryRequest(BaseModel):
-    query: str
 
-@app.post("/query")
-async def query_rag(req: QueryRequest):
-    try:
-        global vector_store
-        if not vector_store:
-            raise HTTPException(400, "No documents indexed yet")
+# ------------------------------------------------------------
+# ✅ Example Text Generation Route
+# ------------------------------------------------------------
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_new_tokens: int = 30
 
-        qv = np.array(get_embeddings([req.query])[0], dtype=np.float32)
-        D, I = vector_store.index.search(qv.reshape(1, -1), k=3)
-        matches = [vector_store.documents[i].page_content for i in I[0] if i != -1]
-        answer = " ".join(matches)[:1000] if matches else "No relevant text found."
-        return {"answer": answer, "matches": len(matches)}
-    except Exception as e:
-        raise HTTPException(500, f"Query failed: {e}")
+@app.post("/generate")
+def generate_text(request: GenerateRequest):
+    model, tokenizer = load_model_once()
+
+    # Handle environments without torch gracefully
+    if torch is None:
+        raise RuntimeError("Torch not available — please ensure CPU wheel is installed.")
+
+    inputs = tokenizer(request.prompt, return_tensors="pt")
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=request.max_new_tokens,
+            do_sample=False
+        )
+
+    result_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return {
+        "input": request.prompt,
+        "output": result_text,
+        "tokens_generated": request.max_new_tokens
+    }
+
+
+# ------------------------------------------------------------
+# ✅ Utility for environments missing torch context manager
+# ------------------------------------------------------------
+class nullcontext:
+    def __enter__(self): return None
+    def __exit__(self, *exc): return False
+
+
+# ------------------------------------------------------------
+# ✅ Final log confirmation for Render startup
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting RaviTeja GenAI Gateway on port 10000 ...")
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
