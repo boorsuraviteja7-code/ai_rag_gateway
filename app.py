@@ -45,7 +45,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         docs = [Document(page_content=chunk) for chunk in splitter.split_text(text)]
 
         global vector_store
-        vector_store = FAISS.from_documents(docs, embedding_function=get_embedding)
+        vector_store = FAISS.from_documents(docs, embedding=get_embedding)
 
         return {"message": f"File {file.filename} processed successfully"}
     except Exception as e:
