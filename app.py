@@ -2,6 +2,8 @@
 import os
 import sys
 from typing import Optional
+from fastapi import FastAPI, UploadFile, File
+from pydantic import BaseModel
 
 # ------------------------------------------------------------
 # ✅ FIX 1: Safe startup environment variables for Render
@@ -15,7 +17,7 @@ os.environ.update({
 })
 
 # ------------------------------------------------------------
-# ✅ Optional: Prevent heavy torch imports during Render health probe
+# ✅ Optional: prevent heavy imports before Render health check
 # ------------------------------------------------------------
 if os.environ.get("RENDER") == "true":
     sys.modules["torch"] = __import__("torch", fromlist=[""])
@@ -26,20 +28,17 @@ try:
 except Exception:
     torch = None
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-
 # ------------------------------------------------------------
 # ✅ Initialize FastAPI
 # ------------------------------------------------------------
 app = FastAPI(
     title="RaviTeja GenAI Gateway",
-    description="FastAPI app deployed on Render with HuggingFace lazy loading",
-    version="1.0.0"
+    description="FastAPI app deployed on Render with HuggingFace lazy loading + PDF support",
+    version="1.1.0"
 )
 
 # ------------------------------------------------------------
-# ✅ FIX 2: Root and Health Routes (Render health probe fix)
+# ✅ FIX 2: Root + Health routes
 # ------------------------------------------------------------
 @app.get("/")
 def root():
@@ -54,9 +53,12 @@ def root():
 def health():
     return {"ok": True, "message": "Healthy 💚"}
 
+@app.head("/")
+def head_root():
+    return {"status": "ok"}
 
 # ------------------------------------------------------------
-# ✅ FIX 3: Lazy-load HuggingFace model (loaded on first request only)
+# ✅ FIX 3: Lazy-load HuggingFace model
 # ------------------------------------------------------------
 _model = None
 _tokenizer = None
@@ -66,12 +68,11 @@ def load_model_once():
     if _model is not None and _tokenizer is not None:
         return _model, _tokenizer
 
-    # Import heavy dependencies only when needed
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     model_name = os.getenv("HF_MODEL_NAME", "sshleifer/tiny-gpt2")
-
     print(f"🔄 Loading HuggingFace model: {model_name}")
+
     _tokenizer = AutoTokenizer.from_pretrained(model_name)
     _model = AutoModelForCausalLM.from_pretrained(model_name)
 
@@ -80,17 +81,15 @@ def load_model_once():
 
 
 # ------------------------------------------------------------
-# ✅ Example Text Generation Route
+# ✅ Text generation endpoint
 # ------------------------------------------------------------
 class GenerateRequest(BaseModel):
     prompt: str
-    max_new_tokens: int = 30
+    max_new_tokens: int = 50
 
 @app.post("/generate")
 def generate_text(request: GenerateRequest):
     model, tokenizer = load_model_once()
-
-    # Handle environments without torch gracefully
     if torch is None:
         raise RuntimeError("Torch not available — please ensure CPU wheel is installed.")
 
@@ -106,13 +105,55 @@ def generate_text(request: GenerateRequest):
     result_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return {
         "input": request.prompt,
-        "output": result_text,
+        "output": result_text.strip(),
         "tokens_generated": request.max_new_tokens
     }
 
 
 # ------------------------------------------------------------
-# ✅ Utility for environments missing torch context manager
+# ✅ NEW FEATURE: PDF Upload & Text Extraction
+# ------------------------------------------------------------
+from PyPDF2 import PdfReader
+
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...), summarize: bool = True):
+    """
+    Upload a PDF, extract text, and optionally summarize using the model.
+    """
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Please upload a PDF file."}
+
+    # Read the PDF in-memory
+    reader = PdfReader(file.file)
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+
+    if not text.strip():
+        return {"error": "No readable text found in PDF."}
+
+    result = {
+        "filename": file.filename,
+        "text_length": len(text),
+        "preview": text[:1000]
+    }
+
+    # Optional: summarize with model
+    if summarize:
+        prompt = f"Summarize this text:\n{text[:1500]}"
+        model, tokenizer = load_model_once()
+
+        inputs = tokenizer(prompt, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model.generate(**inputs, max_new_tokens=120)
+        summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        result["summary"] = summary.strip()
+
+    return result
+
+
+# ------------------------------------------------------------
+# ✅ Helper for no-torch environments
 # ------------------------------------------------------------
 class nullcontext:
     def __enter__(self): return None
@@ -120,7 +161,7 @@ class nullcontext:
 
 
 # ------------------------------------------------------------
-# ✅ Final log confirmation for Render startup
+# ✅ Final startup message
 # ------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
