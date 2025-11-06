@@ -1,4 +1,5 @@
 import os
+import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -9,6 +10,11 @@ from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from pathlib import Path
 import numpy as np
+
+# ----------------------------------------------------
+# ✅ Optimize for low memory
+# ----------------------------------------------------
+torch.set_num_threads(1)  # prevent PyTorch from spawning extra threads
 
 # ----------------------------------------------------
 # ✅ Initialize FastAPI
@@ -25,9 +31,13 @@ app.add_middleware(
 )
 
 # ----------------------------------------------------
-# ✅ Load Local Embedding Model (no OpenAI key needed)
+# ✅ Load Lightweight Local Embedding Model (cached)
 # ----------------------------------------------------
-embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+# Cache model under /tmp (Render allows this space)
+os.environ["SENTENCE_TRANSFORMERS_HOME"] = "/tmp"
+
+# Use the lightweight model (only ~120 MB)
+embedding_model = SentenceTransformer("sentence-transformers/paraphrase-MiniLM-L3-v2")
 
 def get_embeddings(texts):
     """Generate embeddings locally without OpenAI API."""
@@ -78,6 +88,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         if not text.strip():
             raise HTTPException(status_code=400, detail="No text found in the PDF")
 
+        # Split into chunks
         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         chunks = splitter.split_text(text)
         docs = [Document(page_content=c) for c in chunks]
@@ -92,6 +103,7 @@ async def upload_pdf(file: UploadFile = File(...)):
         index = faiss.IndexFlatL2(dim)
         index.add(np.array(embeddings_list).astype("float32"))
 
+        # Store globally
         global vector_store
         vector_store = FAISS(embedding_function=get_embeddings, index=index, documents=docs)
 
