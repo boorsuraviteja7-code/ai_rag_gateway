@@ -5,7 +5,7 @@ uvicorn[standard]==0.38.0
 langchain-core==0.2.35
 langchain-text-splitters==0.2.1
 langchain-community==0.2.11
-langsmith==0.1.64
+langsmith==0.1.80
 
 # Vector search & embeddings
 faiss-cpu==1.12.0
